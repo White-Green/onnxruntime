@@ -3,8 +3,9 @@
 use std::{
     borrow::Cow,
     env, fs,
-    io::{self, Read, Write},
+    io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     str::FromStr,
 };
 
@@ -60,6 +61,7 @@ fn main() {
 fn generate_bindings(include_dir: &Path) {
     let clang_args = &[
         format!("-I{}", include_dir.display()),
+        "-fvisibility=default".to_string(),
         format!(
             "-I{}",
             include_dir
@@ -69,6 +71,16 @@ fn generate_bindings(include_dir: &Path) {
                 .display()
         ),
     ];
+
+    let additional_clang_args = if env::var("TARGET").unwrap().contains("emscripten") {
+        let emscripten_include_directories = search_emscripten_include_directories();
+        emscripten_include_directories
+            .into_iter()
+            .map(|p| format!("-I{}", p.display()))
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
 
     let path = include_dir
         .join("onnxruntime")
@@ -85,6 +97,7 @@ fn generate_bindings(include_dir: &Path) {
         .header(path.to_string_lossy().to_string())
         // The current working directory is 'onnxruntime-sys'
         .clang_args(clang_args)
+        .clang_args(additional_clang_args)
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
         .parse_callbacks(Box::new(bindgen::CargoCallbacks))
@@ -354,12 +367,12 @@ fn prebuilt_archive_url() -> (PathBuf, String) {
     let prebuilt_archive = format!(
         "onnxruntime-{}-{}.{}",
         triplet.as_onnx_str(),
-        ORT_VERSION,
+        ORT_VERSION.trim(),
         triplet.os.archive_extension()
     );
     let prebuilt_url = format!(
         "{}/v{}/{}",
-        ORT_RELEASE_BASE_URL, ORT_VERSION, prebuilt_archive
+        ORT_RELEASE_BASE_URL, ORT_VERSION.trim(), prebuilt_archive
     );
 
     (PathBuf::from(prebuilt_archive), prebuilt_url)
@@ -419,11 +432,43 @@ fn prepare_libort_dir() -> PathBuf {
 fn prepare_libort_dir_compiled() -> PathBuf {
     let mut config = cmake::Config::new("../../cmake");
 
-    config.define("onnxruntime_BUILD_SHARED_LIB", "ON");
+    // config.define("onnxruntime_BUILD_SHARED_LIB", "ON");
 
     if env::var(ORT_RUST_ENV_GPU).unwrap_or_default().parse() == Ok(Accelerator::Cuda) {
         config.define("onnxruntime_USE_CUDA", "ON");
     }
 
+    config.generator("Ninja");
+
     config.build()
+}
+
+fn search_emscripten_include_directories() -> impl IntoIterator<Item = PathBuf> {
+    let empty_cpp_path = Path::new(&env::var_os("OUT_DIR").unwrap()).join("empty.cpp");
+    fs::write(&empty_cpp_path, b"").unwrap();
+
+    let mut command;
+    if cfg!(target_os = "windows") {
+        command = Command::new("cmd");
+        command.arg("/C");
+    } else {
+        command = Command::new("sh");
+        command.arg("-c");
+    };
+
+    let empp_output = command
+        .arg(format!("em++ --verbose {}", empty_cpp_path.display()))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    empp_output
+        .stderr
+        .lines()
+        .map(Result::unwrap)
+        .skip_while(|line| line.trim() != "#include <...> search starts here:")
+        .skip(1)
+        .take_while(|line| line.trim() != "End of search list.")
+        .map(|line| PathBuf::from(line.trim()))
+        .collect::<Vec<_>>()
 }
